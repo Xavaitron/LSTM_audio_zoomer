@@ -13,19 +13,19 @@ from tqdm import tqdm
 # 1. CONFIGURATION
 # ==========================================
 # Path to your Dataset
-DATASET_ROOT = r"C:\Users\ironp\Downloads\SP Cup\LSTM_model\anechoic_dataset"
+DATASET_ROOT = r"D:\anechoic_dataset_v2"
 
 # Hyperparameters
-BATCH_SIZE = 128         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU,so tune according to that
+BATCH_SIZE = 128         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU
 LEARNING_RATE = 1e-3     # Standard Adam LR
-N_EPOCHS = 60            # Number of epochs
-N_FFT = 512              # Number of FFT bins(technically its N_FFT/2+1)
+N_EPOCHS = 60            # Max number of epochs
+PATIENCE = 10            # Early Stopping Patience
+N_FFT = 512              # Number of FFT bins
 HOP_LENGTH = 160         # 10ms at 16kHz
 HIDDEN_SIZE = 320        # Tuned for the target parameter size
 NUM_WORKERS = 4          # Number of CPU threads for data loading
 
-# Device Config
-DEVICE = torch.device("GPU" if torch.cuda.is_available() else "CPU")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ==========================================
@@ -55,7 +55,6 @@ class AnechoicDataset(Dataset):
         target_path = os.path.join(folder, "target.wav")
         
         # Load Audio [Channels, Time]
-        # Mix is Stereo (2, T), Target is Mono (1, T)
         mix_wav, sr = torchaudio.load(mix_path)
         target_wav, _ = torchaudio.load(target_path)
         
@@ -90,9 +89,6 @@ class StatefulStereoMaskNet(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x_left_stft, x_right_stft):
-        """
-        Expects inputs: [Batch, Freq, Time] (Complex)
-        """
         # 1. Feature Extraction
         mag_left = torch.abs(x_left_stft)
         log_mag = torch.log1p(mag_left)
@@ -123,7 +119,6 @@ class StatefulStereoMaskNet(nn.Module):
 # ==========================================
 # 4. LOSS FUNCTION (SI-SDR + STOI)
 # ==========================================
-
 class SISDR_STOI_Loss(nn.Module):
     def __init__(self, n_fft=512, hop_length=160, alpha_sisdr=1.0, alpha_stoi=5.0):
         super(SISDR_STOI_Loss, self).__init__()
@@ -136,7 +131,7 @@ class SISDR_STOI_Loss(nn.Module):
 
     def si_sdr_loss(self, estimate, reference):
         eps = 1e-8
-        # Ensure zero mean to handle DC offset
+        # Ensure zero mean
         estimate = estimate - torch.mean(estimate, dim=-1, keepdim=True)
         reference = reference - torch.mean(reference, dim=-1, keepdim=True)
         
@@ -152,16 +147,15 @@ class SISDR_STOI_Loss(nn.Module):
         ratio = torch.sum(target_projection ** 2, dim=-1) / (torch.sum(noise ** 2, dim=-1) + eps)
         si_sdr = 10 * torch.log10(ratio + eps)
         
-        # Return negative mean (since we want to maximize SI-SDR)
         return -torch.mean(si_sdr)
 
     def stoi_proxy_loss(self, est_stft, ref_stft):
-        # Differentiable Proxy for STOI (Spectral Correlation)
+        # Differentiable Proxy for STOI
         eps = 1e-8
         mag_est = torch.abs(est_stft) + eps
         mag_ref = torch.abs(ref_stft) + eps
         
-        # Normalize across the Frequency dimension (Dim 1)
+        # Normalize across Frequency dimension
         mean_est = torch.mean(mag_est, dim=1, keepdim=True)
         std_est = torch.std(mag_est, dim=1, keepdim=True) + eps
         norm_est = (mag_est - mean_est) / std_est
@@ -175,8 +169,7 @@ class SISDR_STOI_Loss(nn.Module):
         return -correlation
 
     def forward(self, predicted_stft, target_waveform):
-        # 1. Reconstruct Waveform using ISTFT (The Fix)
-        # Note: predicted_stft is [Batch, Freq, Time] (Complex)
+        # 1. Reconstruct Waveform using ISTFT
         predicted_waveform = torch.istft(
             predicted_stft, 
             n_fft=self.n_fft, 
@@ -185,16 +178,15 @@ class SISDR_STOI_Loss(nn.Module):
             return_complex=False
         )
         
-        # 2. Match Lengths (ISTFT can be slightly longer/shorter due to padding)
+        # 2. Match Lengths
         min_len = min(predicted_waveform.shape[-1], target_waveform.shape[-1])
         predicted_waveform = predicted_waveform[..., :min_len]
         target_waveform = target_waveform[..., :min_len]
         
-        # 3. Calculate SI-SDR on Time Domain
+        # 3. Calculate SI-SDR
         loss_sisdr = self.si_sdr_loss(predicted_waveform, target_waveform)
         
-        # 4. Calculate STOI on Frequency Domain
-        # We need the Target STFT for this
+        # 4. Calculate STOI
         with torch.no_grad():
             target_stft = torch.stft(
                 target_waveform, 
@@ -203,7 +195,7 @@ class SISDR_STOI_Loss(nn.Module):
                 window=self.window, 
                 return_complex=True
             )
-            # Align STFT shapes if necessary (usually they match if waveforms match)
+            # Align STFT shapes
             if target_stft.shape[-1] != predicted_stft.shape[-1]:
                  min_frames = min(target_stft.shape[-1], predicted_stft.shape[-1])
                  target_stft = target_stft[..., :min_frames]
@@ -240,63 +232,53 @@ def main():
     criterion_warmup = nn.L1Loss()
     criterion_main = SISDR_STOI_Loss(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     
-    # STFT Helper (Pre-instantiated window)
+    # STFT Helper
     torch_window = torch.hann_window(N_FFT).to(DEVICE)
     
     best_val_loss = float('inf')
+    patience_counter = 0 
     
     print(f"Starting Training: {len(train_ds)} train, {len(val_ds)} validation samples.")
+    print(f"Early Stopping Patience: {PATIENCE} epochs")
     
     for epoch in range(N_EPOCHS):
         model.train()
         train_loss_total = 0
         
-        # Switch Loss Function? (Warmup for Epoch 0 only)
-        # Using L1 for the first epoch stabilizes the random weights nicely
         use_warmup = (epoch < 1) 
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{N_EPOCHS}")
         
         for batch_idx, (mix_wav, target_wav) in enumerate(loop):
-            # To GPU
-            mix_wav = mix_wav.to(DEVICE)       # [Batch, 2, Time]
-            target_wav = target_wav.to(DEVICE) # [Batch, 1, Time]
-            target_wav = target_wav.squeeze(1) # [Batch, Time]
+            mix_wav = mix_wav.to(DEVICE)
+            target_wav = target_wav.to(DEVICE).squeeze(1)
             
             # Compute STFT
-            # Flatten channels to compute STFT in parallel
             B, C, T = mix_wav.shape
             mix_flat = mix_wav.view(B*C, T)
-            
             stft_mix = torch.stft(mix_flat, N_FFT, HOP_LENGTH, window=torch_window, return_complex=True)
-            stft_mix = stft_mix.view(B, C, stft_mix.shape[1], stft_mix.shape[2]) # [Batch, 2, Freq, Time]
+            stft_mix = stft_mix.view(B, C, stft_mix.shape[1], stft_mix.shape[2])
             
             stft_left = stft_mix[:, 0, :, :]
             stft_right = stft_mix[:, 1, :, :]
             
-            # Forward Pass
+            # Forward
             predicted_stft, mask = model(stft_left, stft_right)
             
-            # Loss Calculation
+            # Loss
             if use_warmup:
-                # Simple Magnitude Distance (L1)
-                # Need target STFT
                 with torch.no_grad():
                     target_stft = torch.stft(target_wav, N_FFT, HOP_LENGTH, window=torch_window, return_complex=True)
                 loss = criterion_warmup(torch.abs(predicted_stft), torch.abs(target_stft))
                 stats = "Warmup L1"
             else:
-                # Advanced Perceptual Loss
                 loss, sisdr, stoi = criterion_main(predicted_stft, target_wav)
                 stats = f"SI-SDR: {sisdr:.2f} | STOI: {stoi:.2f}"
             
             # Backprop
             optimizer.zero_grad()
             loss.backward()
-            
-            # Gradient Clipping (Important for LSTM stability)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
             optimizer.step()
             
             train_loss_total += loss.item()
@@ -309,7 +291,6 @@ def main():
             for mix_wav, target_wav in val_loader:
                 mix_wav, target_wav = mix_wav.to(DEVICE), target_wav.to(DEVICE).squeeze(1)
                 
-                # STFT (Manual)
                 B, C, T = mix_wav.shape
                 stft_mix = torch.stft(mix_wav.view(B*C, T), N_FFT, HOP_LENGTH, window=torch_window, return_complex=True)
                 stft_mix = stft_mix.view(B, C, stft_mix.shape[1], stft_mix.shape[2])
@@ -327,11 +308,19 @@ def main():
         avg_val_loss = val_loss_total / len(val_loader)
         print(f"Validation Loss: {avg_val_loss:.4f}")
         
-        # Save Best Model
+        # --- EARLY STOPPING CHECK ---
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            patience_counter = 0  # Reset counter
             torch.save(model.state_dict(), "LSTM_model.pth")
             print(">>> New Best Model Saved!")
+        else:
+            patience_counter += 1
+            print(f"No improvement. Early Stopping Counter: {patience_counter}/{PATIENCE}")
+            
+            if patience_counter >= PATIENCE:
+                print("!!! Early stopping triggered. Training stopped. !!!")
+                break
             
     print("Training Complete.")
 
