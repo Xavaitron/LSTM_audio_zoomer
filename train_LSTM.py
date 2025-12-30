@@ -13,7 +13,7 @@ from tqdm import tqdm
 # 1. CONFIGURATION
 # ==========================================
 # Path to your Dataset
-DATASET_ROOT = r"D:\anechoic_dataset_v2"
+DATASET_ROOT = r"D:\anechoic_dataset_v3"
 
 # Hyperparameters
 BATCH_SIZE = 128         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU
@@ -23,7 +23,7 @@ PATIENCE = 10            # Early Stopping Patience
 N_FFT = 512              # Number of FFT bins
 HOP_LENGTH = 160         # 10ms at 16kHz
 HIDDEN_SIZE = 320        # Tuned for the target parameter size
-NUM_WORKERS = 4          # Number of CPU threads for data loading
+NUM_WORKERS = 8          # Number of CPU threads for data loading
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -312,7 +312,7 @@ def main():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0  # Reset counter
-            torch.save(model.state_dict(), "LSTM_model.pth")
+            torch.save(model.state_dict(), "LSTM_model_v2.pth")
             print(">>> New Best Model Saved!")
         else:
             patience_counter += 1
