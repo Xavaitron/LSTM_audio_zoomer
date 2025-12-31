@@ -16,7 +16,7 @@ from tqdm import tqdm
 DATASET_ROOT = r"D:\anechoic_dataset_v3"
 
 # Hyperparameters
-BATCH_SIZE = 128         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU
+BATCH_SIZE = 512         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU
 LEARNING_RATE = 1e-3     # Standard Adam LR
 N_EPOCHS = 60            # Max number of epochs
 PATIENCE = 10            # Early Stopping Patience

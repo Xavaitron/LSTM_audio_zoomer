@@ -15,7 +15,7 @@ from tqdm import tqdm
 # 1. CONFIGURATION
 # ==========================================
 DATASET_ROOT = r"D:\anechoic_dataset_v3" 
-BATCH_SIZE = 64
+BATCH_SIZE = 512
 LEARNING_RATE = 1e-3
 N_EPOCHS = 60
 PATIENCE = 10
