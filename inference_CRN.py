@@ -11,12 +11,16 @@ from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEval
 # 1. CONFIGURATION
 # ==========================================
 MODEL_PATH = "CRN_Model.pth"        # Path to your trained model checkpoint
-SAMPLE_FOLDER = r"D:\anechoic_dataset_v3\sample_00072" # Change to specific sample folder
-OUTPUT_DIR = "inference_CRN"    # Where to save the output files
+SAMPLE_FOLDER = r"D:\anechoic_dataset_v3\sample_00014" 
+OUTPUT_DIR = "inference_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
 HOP_LENGTH = 160
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- CUSTOM ANGLE SETTING ---
+# Set to None to use the ground truth angle from meta.json.
+CUSTOM_ANGLE = 90.0
 
 # ==========================================
 # 2. MODEL DEFINITION
@@ -101,7 +105,6 @@ def load_audio(path, target_len=None):
         resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
         waveform = resampler(waveform)
     
-    # Handle length if needed 
     if target_len:
         if waveform.shape[-1] < target_len:
             waveform = F.pad(waveform, (0, target_len - waveform.shape[-1]))
@@ -111,7 +114,6 @@ def load_audio(path, target_len=None):
     return waveform
 
 def get_model_size_mb(model):
-    """Calculates the model size in MB based on parameters."""
     param_size = 0
     for param in model.parameters():
         param_size += param.nelement() * param.element_size()
@@ -134,7 +136,6 @@ def run_inference():
     # 1. Load Model
     model = SpatialMediumCRN(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     try:
-        # Added weights_only=True to silence the FutureWarning
         state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
         model.load_state_dict(state_dict)
         print("Model weights loaded successfully.")
@@ -143,51 +144,52 @@ def run_inference():
         return
     model.eval()
 
-    # 2. Calculate Model Stats
-    params = count_parameters(model)
-    size_mb = get_model_size_mb(model)
-    print(f"\n[Model Stats]")
-    print(f"Parameter Count: {params:,}")
-    print(f"Model Size (approx): {size_mb:.2f} MB")
-
-    # 3. Load Data
+    # 2. Load Data & Determine Angle
     print(f"\n[Loading Sample] {SAMPLE_FOLDER}")
     mix_path = os.path.join(SAMPLE_FOLDER, "mixture.wav")
     target_path = os.path.join(SAMPLE_FOLDER, "target.wav")
     meta_path = os.path.join(SAMPLE_FOLDER, "meta.json")
 
+    # Load Ground Truth Angle
     with open(meta_path, 'r') as f:
         meta = json.load(f)
-        target_angle = float(meta['target_angle'])
+        ground_truth_angle = float(meta['target_angle'])
+
+    # Determine which angle to use for inference
+    if CUSTOM_ANGLE is not None:
+        target_angle = float(CUSTOM_ANGLE)
+        print(f"!! USING CUSTOM ANGLE: {target_angle}° (Ground Truth was {ground_truth_angle}°)")
+    else:
+        target_angle = ground_truth_angle
+        print(f"Using Ground Truth Angle: {target_angle}°")
 
     # Load and prep audio
-    mixture = load_audio(mix_path).unsqueeze(0).to(DEVICE) # Add batch dim
+    mixture = load_audio(mix_path).unsqueeze(0).to(DEVICE)
     target = load_audio(target_path)
-    if target.shape[0] > 1: target = target[0:1, :] # Force Mono target
+    if target.shape[0] > 1: target = target[0:1, :] 
     target = target.to(DEVICE)
 
     # Angle tensor
     angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-    # 4. Run Inference
+    # 3. Run Inference
     with torch.no_grad():
         estimate = model(mixture, angle_tensor)
         
-        # Align lengths for metrics (min length)
+        # Align lengths
         min_len = min(estimate.shape[-1], target.shape[-1])
         est_trim = estimate[..., :min_len]
         tgt_trim = target[..., :min_len]
 
-    # 5. Calculate Metrics
+    # 4. Calculate Metrics
     print("\n[Calculating Metrics...]")
-    
-    # Initialize metric calculators
-    # wb=True for WideBand PESQ (16k), False for NarrowBand (8k)
+    if CUSTOM_ANGLE is not None and CUSTOM_ANGLE != ground_truth_angle:
+        print("NOTE: Metrics may be low because you are steering away from the ground truth target.")
+
     pesq_metric = PerceptualEvaluationSpeechQuality(fs=SAMPLE_RATE, mode='wb').to(DEVICE)
     stoi_metric = ShortTimeObjectiveIntelligibility(fs=SAMPLE_RATE, extended=False).to(DEVICE)
     sisdr_metric = ScaleInvariantSignalDistortionRatio().to(DEVICE)
 
-    # Compute
     score_pesq = pesq_metric(est_trim, tgt_trim)
     score_stoi = stoi_metric(est_trim, tgt_trim)
     score_sisdr = sisdr_metric(est_trim, tgt_trim)
@@ -196,28 +198,25 @@ def run_inference():
     print(f"STOI:   {score_stoi.item():.4f}")
     print(f"PESQ:   {score_pesq.item():.4f}")
 
-    # 6. Save Results
+    # 5. Save Results
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     sample_name = os.path.basename(SAMPLE_FOLDER)
     
-    out_mix_path = os.path.join(OUTPUT_DIR, f"{sample_name}_mixture.wav")
-    out_tgt_path = os.path.join(OUTPUT_DIR, f"{sample_name}_target.wav")
-    out_est_path = os.path.join(OUTPUT_DIR, f"{sample_name}_output.wav")
+    # Modify filename if custom angle is used to avoid confusion
+    if CUSTOM_ANGLE is not None:
+        angle_str = f"_ang{int(CUSTOM_ANGLE)}"
+    else:
+        angle_str = ""
 
-    # Save audio (ensure on CPU for saving)
-    # Mixture was (Batch=1, Channels=4, Time) -> squeeze to (4, Time)
+    out_mix_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_mixture.wav")
+    out_tgt_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_target.wav")
+    out_est_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_output.wav")
+
     torchaudio.save(out_mix_path, mixture.squeeze(0).cpu(), SAMPLE_RATE)
-    
-    # Target was (1, Time) -> No change needed
     torchaudio.save(out_tgt_path, tgt_trim.cpu(), SAMPLE_RATE)
-    
-    # Estimate is (Batch=1, Time)
-    # FIXED: Removed .squeeze(0) to keep shape as (1, Time) which torchaudio requires for mono
     torchaudio.save(out_est_path, est_trim.cpu(), SAMPLE_RATE)
 
     print(f"\n[Files Saved]")
-    print(f"Mixture: {out_mix_path}")
-    print(f"Target:  {out_tgt_path}")
     print(f"Output:  {out_est_path}")
 
 if __name__ == "__main__":
