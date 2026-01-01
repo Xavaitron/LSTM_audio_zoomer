@@ -12,17 +12,17 @@ import numpy as np
 from tqdm import tqdm
 
 # ==========================================
-# 1. CONFIGURATION (PESQ OPTIMIZATION SETUP)
+# 1. CONFIGURATION (COMPRESSED PESQ OPTIMIZATION)
 # ==========================================
 DATASET_ROOT = r"D:\anechoic_dataset_v3_male_female" 
-PRETRAINED_PATH = "CRN_Model_FineTuned.pth"
-NEW_MODEL_NAME = "CRN_Model_FineTuned_HighPESQ.pth" 
+PRETRAINED_PATH = "CRN_Model_FineTuned_HighPESQ.pth"
+NEW_MODEL_NAME = "CRN_Model_FineTuned_CompressedPESQ.pth" 
 
 # HYPERPARAMETERS
 BATCH_SIZE = 128
-LEARNING_RATE = 1e-4      # Low LR for fine-tuning
-N_EPOCHS = 15             # Reduced: PESQ fine-tuning converges quickly
-PATIENCE = 3              # Stricter patience to prevent overfitting specific voices
+LEARNING_RATE = 1e-4      
+N_EPOCHS = 20             # Increased to 20 for Compressed Loss convergence
+PATIENCE = 5              # Relaxed slightly to allow for fine detail learning
 N_FFT = 512
 HOP_LENGTH = 160
 SILENCE_PROB = 0.1
@@ -155,10 +155,10 @@ class SpatialMediumCRN(nn.Module):
         return torch.istft(est_complex, self.n_fft, self.hop_length, window=self.window)
 
 # ==========================================
-# 4. LOSS FUNCTIONS (SI-SDR + MULTI-RES STFT)
+# 4. LOSS FUNCTIONS 
 # ==========================================
 
-# A. Standard SI-SDR Loss (For Separation)
+# A. Standard SI-SDR Loss
 class SpatialSeparationLoss(nn.Module):
     def __init__(self, n_fft=512, hop_length=160):
         super().__init__()
@@ -181,23 +181,22 @@ class SpatialSeparationLoss(nn.Module):
         min_len = min(estimate.shape[-1], reference.shape[-1])
         estimate = estimate[..., :min_len]
         reference = reference[..., :min_len]
-
         ref_energy = torch.sum(reference ** 2, dim=-1)
-        has_speech = ref_energy > 1e-5
         
-        if has_speech.any():
-            loss = self.si_sdr(estimate[has_speech], reference[has_speech])
-            return loss
+        if (ref_energy > 1e-5).any():
+            return self.si_sdr(estimate[ref_energy > 1e-5], reference[ref_energy > 1e-5])
         else:
             return self.mse(estimate, reference) * 1000.0
 
-# B. NEW Multi-Resolution STFT Loss (For PESQ/Quality)
+# B. NEW ENHANCED Multi-Resolution Loss (Power-Law Compressed)
 class MultiResolutionSTFTLoss(nn.Module):
-    def __init__(self, fft_sizes=[512, 1024, 2048], hop_sizes=[50, 120, 240], win_lengths=[240, 600, 1200]):
+    def __init__(self, fft_sizes=[512, 1024, 2048], hop_sizes=[50, 120, 240], win_lengths=[240, 600, 1200], factor_sc=0.5, factor_mag=0.5):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_sizes = hop_sizes
         self.win_lengths = win_lengths
+        self.factor_sc = factor_sc
+        self.factor_mag = factor_mag
 
     def stft(self, x, fft_size, hop_size, win_length):
         return torch.stft(x, fft_size, hop_length=hop_size, win_length=win_length, 
@@ -213,23 +212,29 @@ class MultiResolutionSTFTLoss(nn.Module):
             est_stft = self.stft(est, n_fft, hop, win)
             tgt_stft = self.stft(target, n_fft, hop, win)
             
-            est_mag = torch.abs(est_stft) + 1e-7
-            tgt_mag = torch.abs(tgt_stft) + 1e-7
+            # --- COMPRESSION STEP (Mimics Human Ear) ---
+            est_mag = (torch.abs(est_stft) + 1e-7)
+            tgt_mag = (torch.abs(tgt_stft) + 1e-7)
             
-            # Spectral Convergence
-            sc_loss = torch.norm(tgt_mag - est_mag, p="fro") / (torch.norm(tgt_mag, p="fro") + 1e-7)
-            # Log Magnitude (L1)
+            # Power Law Compression (0.3 is standard for audio perceptual loss)
+            est_c = est_mag ** 0.3
+            tgt_c = tgt_mag ** 0.3
+
+            # 1. Spectral Convergence (on Compressed Mag)
+            sc_loss = torch.norm(tgt_c - est_c, p="fro") / (torch.norm(tgt_c, p="fro") + 1e-7)
+            
+            # 2. Log Magnitude Loss (Forces clean up of quiet noise)
             mag_loss = F.l1_loss(torch.log(tgt_mag), torch.log(est_mag))
-            
-            loss += sc_loss + mag_loss
+
+            loss += (self.factor_sc * sc_loss) + (self.factor_mag * mag_loss)
             
         return loss / len(self.fft_sizes)
 
 # ==========================================
-# 5. FINE-TUNING LOOP WITH MIXED LOSS
+# 5. FINE-TUNING LOOP
 # ==========================================
 def main():
-    print(f"--- Fine-Tuning for PESQ on {DEVICE} ---")
+    print(f"--- Fine-Tuning for Compressed PESQ on {DEVICE} ---")
     
     # 1. Dataset
     try:
@@ -248,7 +253,6 @@ def main():
     # 2. Model
     model = SpatialMediumCRN(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     
-    # Load Weights
     if os.path.exists(PRETRAINED_PATH):
         print(f"[INFO] Loading pre-trained weights from: {PRETRAINED_PATH}")
         try:
@@ -260,7 +264,7 @@ def main():
     else:
         print(f"[WARNING] Pre-trained file not found! Starting scratch.")
 
-    # 3. Optimizer & Mixed Loss Setup
+    # 3. Optimizer & Mixed Loss
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
     criterion_sisdr = SpatialSeparationLoss().to(DEVICE)
@@ -269,7 +273,7 @@ def main():
     best_val_loss = float('inf')
     patience_counter = 0 
     
-    print(f"\nStarting PESQ Fine-Tuning: {len(train_ds)} train, {len(val_ds)} validation.")
+    print(f"\nStarting Compressed Loss Fine-Tuning: {len(train_ds)} train, {len(val_ds)} validation.")
     
     for epoch in range(N_EPOCHS):
         model.train()
@@ -281,12 +285,11 @@ def main():
             
             estimate = model(mixture, angle)
             
-            # --- MIXED LOSS CALCULATION ---
+            # --- MIXED LOSS ---
             loss_s = criterion_sisdr(estimate, target)
             loss_m = criterion_mrstft(estimate, target)
             
-            # Weight: SI-SDR (1.0) + MultiRes (10.0)
-            # We scale MultiRes by 10 because its raw value is usually small (~0.5-1.0) compared to SI-SDR gradients
+            # Weighted Sum: SI-SDR + 10 * Compressed Spectral Loss
             loss = loss_s + (10.0 * loss_m)
             
             optimizer.zero_grad()
@@ -319,7 +322,7 @@ def main():
             best_val_loss = avg_val_loss
             patience_counter = 0
             torch.save(model.state_dict(), NEW_MODEL_NAME)
-            print(f">>> New Best PESQ Model Saved: {NEW_MODEL_NAME}")
+            print(f">>> New Best Model Saved: {NEW_MODEL_NAME}")
         else:
             patience_counter += 1
             print(f"No improvement. Counter: {patience_counter}/{PATIENCE}")
