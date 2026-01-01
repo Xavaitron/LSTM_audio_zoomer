@@ -1,5 +1,6 @@
 import os
 import json
+import time  # <--- Added for timing
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +11,8 @@ from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEval
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_PATH = "CRN_Model_FineTuned.pth"        # Path to your trained model checkpoint
-SAMPLE_FOLDER = r"D:\test_dataset\test_sample_04005" 
+MODEL_PATH = "CRN_Model_FineTuned_CompressedPESQ.pth"        
+SAMPLE_FOLDER = r"D:\test_dataset\test_sample_00380" 
 OUTPUT_DIR = "test_inference_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
@@ -113,17 +114,6 @@ def load_audio(path, target_len=None):
             
     return waveform
 
-def get_model_size_mb(model):
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    return size_all_mb
-
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -143,6 +133,12 @@ def run_inference():
         print(f"Error: Model file '{MODEL_PATH}' not found!")
         return
     model.eval()
+
+    # --- SHOW MODEL STATS ---
+    params = count_parameters(model)
+    print(f"\n[Model Statistics]")
+    print(f"Total Parameters: {params:,}")
+    print(f"Model Size (MB):  {params * 4 / (1024**2):.2f} MB (approx float32)")
 
     # 2. Load Data & Determine Angle
     print(f"\n[Loading Sample] {SAMPLE_FOLDER}")
@@ -172,14 +168,37 @@ def run_inference():
     # Angle tensor
     angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-    # 3. Run Inference
+    # 3. Run Inference (WITH TIMING)
+    print("\n[Running Inference...]")
+    
+    # Warmup pass (optional, mostly for GPU)
+    if DEVICE.type == 'cuda':
+        with torch.no_grad():
+            _ = model(mixture, angle_tensor)
+            torch.cuda.synchronize()
+
+    start_time = time.time()
     with torch.no_grad():
         estimate = model(mixture, angle_tensor)
         
-        # Align lengths
-        min_len = min(estimate.shape[-1], target.shape[-1])
-        est_trim = estimate[..., :min_len]
-        tgt_trim = target[..., :min_len]
+        # Wait for GPU to finish if applicable
+        if DEVICE.type == 'cuda':
+            torch.cuda.synchronize()
+            
+    end_time = time.time()
+    inference_time = end_time - start_time
+    
+    # Calculate Audio Duration
+    audio_duration = mixture.shape[-1] / SAMPLE_RATE
+    
+    print(f"Inference Time:   {inference_time:.4f} seconds")
+    print(f"Audio Duration:   {audio_duration:.2f} seconds")
+    print(f"Real-Time Factor: {inference_time / audio_duration:.4f}x (Lower is faster)")
+    
+    # Align lengths for metrics
+    min_len = min(estimate.shape[-1], target.shape[-1])
+    est_trim = estimate[..., :min_len]
+    tgt_trim = target[..., :min_len]
 
     # 4. Calculate Metrics
     print("\n[Calculating Metrics...]")
