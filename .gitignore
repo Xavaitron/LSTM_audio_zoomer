@@ -1,3 +1,5 @@
 /anechoic_dataset
 /inference_output
 /inference_CRN
+/evaluation_CRN
+/test_inference_CRN

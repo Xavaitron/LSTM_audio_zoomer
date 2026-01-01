@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 import torch
 import torch.nn as nn
@@ -6,21 +7,18 @@ import torch.nn.functional as F
 import torchaudio
 import numpy as np
 from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEvaluationSpeechQuality, ScaleInvariantSignalDistortionRatio
+from tqdm import tqdm
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_PATH = "CRN_Model_FineTuned.pth"        # Path to your trained model checkpoint
-SAMPLE_FOLDER = r"D:\test_dataset\test_sample_00017" 
-OUTPUT_DIR = "test_inference_CRN"    
+MODEL_PATH = "CRN_Model_FineTuned.pth"        # Path to your BEST model
+TEST_DATASET_ROOT = r"D:\test_dataset" 
+OUTPUT_DIR = "evaluation_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
 HOP_LENGTH = 160
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- CUSTOM ANGLE SETTING ---
-# Set to None to use the ground truth angle from meta.json.
-CUSTOM_ANGLE = 90.0
 
 # ==========================================
 # 2. MODEL DEFINITION
@@ -113,111 +111,123 @@ def load_audio(path, target_len=None):
             
     return waveform
 
-def get_model_size_mb(model):
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    return size_all_mb
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
 # ==========================================
-# 4. MAIN INFERENCE LOOP
+# 4. MAIN EVALUATION LOOP
 # ==========================================
-def run_inference():
-    print(f"--- Running Inference on {DEVICE} ---")
+def run_evaluation():
+    print(f"--- Running Full Evaluation on {DEVICE} ---")
     
     # 1. Load Model
     model = SpatialMediumCRN(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     try:
         state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
         model.load_state_dict(state_dict)
-        print("Model weights loaded successfully.")
+        print(f"Model loaded: {MODEL_PATH}")
     except FileNotFoundError:
         print(f"Error: Model file '{MODEL_PATH}' not found!")
         return
     model.eval()
 
-    # 2. Load Data & Determine Angle
-    print(f"\n[Loading Sample] {SAMPLE_FOLDER}")
-    mix_path = os.path.join(SAMPLE_FOLDER, "mixture.wav")
-    target_path = os.path.join(SAMPLE_FOLDER, "target.wav")
-    meta_path = os.path.join(SAMPLE_FOLDER, "meta.json")
-
-    # Load Ground Truth Angle
-    with open(meta_path, 'r') as f:
-        meta = json.load(f)
-        ground_truth_angle = float(meta['target_angle'])
-
-    # Determine which angle to use for inference
-    if CUSTOM_ANGLE is not None:
-        target_angle = float(CUSTOM_ANGLE)
-        print(f"!! USING CUSTOM ANGLE: {target_angle}° (Ground Truth was {ground_truth_angle}°)")
-    else:
-        target_angle = ground_truth_angle
-        print(f"Using Ground Truth Angle: {target_angle}°")
-
-    # Load and prep audio
-    mixture = load_audio(mix_path).unsqueeze(0).to(DEVICE)
-    target = load_audio(target_path)
-    if target.shape[0] > 1: target = target[0:1, :] 
-    target = target.to(DEVICE)
-
-    # Angle tensor
-    angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
-
-    # 3. Run Inference
-    with torch.no_grad():
-        estimate = model(mixture, angle_tensor)
-        
-        # Align lengths
-        min_len = min(estimate.shape[-1], target.shape[-1])
-        est_trim = estimate[..., :min_len]
-        tgt_trim = target[..., :min_len]
-
-    # 4. Calculate Metrics
-    print("\n[Calculating Metrics...]")
-    if CUSTOM_ANGLE is not None and CUSTOM_ANGLE != ground_truth_angle:
-        print("NOTE: Metrics may be low because you are steering away from the ground truth target.")
-
+    # 2. Setup Metrics
     pesq_metric = PerceptualEvaluationSpeechQuality(fs=SAMPLE_RATE, mode='wb').to(DEVICE)
     stoi_metric = ShortTimeObjectiveIntelligibility(fs=SAMPLE_RATE, extended=False).to(DEVICE)
     sisdr_metric = ScaleInvariantSignalDistortionRatio().to(DEVICE)
 
-    score_pesq = pesq_metric(est_trim, tgt_trim)
-    score_stoi = stoi_metric(est_trim, tgt_trim)
-    score_sisdr = sisdr_metric(est_trim, tgt_trim)
-
-    print(f"SI-SDR: {score_sisdr.item():.4f} dB")
-    print(f"STOI:   {score_stoi.item():.4f}")
-    print(f"PESQ:   {score_pesq.item():.4f}")
-
-    # 5. Save Results
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    sample_name = os.path.basename(SAMPLE_FOLDER)
+    # 3. Find Samples
+    sample_folders = sorted(glob.glob(os.path.join(TEST_DATASET_ROOT, "*sample_*")))
     
-    # Modify filename if custom angle is used to avoid confusion
-    if CUSTOM_ANGLE is not None:
-        angle_str = f"_ang{int(CUSTOM_ANGLE)}"
-    else:
-        angle_str = ""
+    if len(sample_folders) == 0:
+        print(f"No samples found in {TEST_DATASET_ROOT}")
+        return
 
-    out_mix_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_mixture.wav")
-    out_tgt_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_target.wav")
-    out_est_path = os.path.join(OUTPUT_DIR, f"{sample_name}{angle_str}_output.wav")
+    print(f"Found {len(sample_folders)} samples. Starting...")
+    
+    # Storage for Averages
+    results = {'sisdr': [], 'stoi': [], 'pesq': []}
+    
+    # Storage for Best STOI
+    best_stoi = -1.0
+    best_stoi_sample = ""
+    best_stoi_stats = {}
 
-    torchaudio.save(out_mix_path, mixture.squeeze(0).cpu(), SAMPLE_RATE)
-    torchaudio.save(out_tgt_path, tgt_trim.cpu(), SAMPLE_RATE)
-    torchaudio.save(out_est_path, est_trim.cpu(), SAMPLE_RATE)
+    # 4. Loop
+    for folder_path in tqdm(sample_folders):
+        sample_name = os.path.basename(folder_path)
+        mix_path = os.path.join(folder_path, "mixture.wav")
+        target_path = os.path.join(folder_path, "target.wav")
+        meta_path = os.path.join(folder_path, "meta.json")
 
-    print(f"\n[Files Saved]")
-    print(f"Output:  {out_est_path}")
+        try:
+            # Load Angle
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+                target_angle = float(meta['target_angle'])
+
+            # Load Audio
+            mixture = load_audio(mix_path).unsqueeze(0).to(DEVICE)
+            target = load_audio(target_path)
+            if target.shape[0] > 1: target = target[0:1, :] 
+            target = target.to(DEVICE)
+
+            # Run Inference
+            angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            
+            with torch.no_grad():
+                estimate = model(mixture, angle_tensor)
+                
+                # Align lengths
+                min_len = min(estimate.shape[-1], target.shape[-1])
+                est_trim = estimate[..., :min_len]
+                tgt_trim = target[..., :min_len]
+
+                # Compute Metrics
+                s_pesq = pesq_metric(est_trim, tgt_trim).item()
+                s_stoi = stoi_metric(est_trim, tgt_trim).item()
+                s_sisdr = sisdr_metric(est_trim, tgt_trim).item()
+                
+                # Add to Averages
+                results['pesq'].append(s_pesq)
+                results['stoi'].append(s_stoi)
+                results['sisdr'].append(s_sisdr)
+                
+                # Check for New Best STOI
+                if s_stoi > best_stoi:
+                    best_stoi = s_stoi
+                    best_stoi_sample = sample_name
+                    best_stoi_stats = {'sisdr': s_sisdr, 'pesq': s_pesq, 'stoi': s_stoi}
+                    
+                    # Save "BEST" files immediately
+                    os.makedirs(OUTPUT_DIR, exist_ok=True)
+                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_output.wav"), est_trim.cpu(), SAMPLE_RATE)
+                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_mixture.wav"), mixture.squeeze(0).cpu(), SAMPLE_RATE)
+                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_target.wav"), tgt_trim.cpu(), SAMPLE_RATE)
+
+        except Exception as e:
+            print(f"Error processing {sample_name}: {e}")
+            continue
+
+    # 5. Report Final Results
+    avg_sisdr = np.mean(results['sisdr'])
+    avg_stoi = np.mean(results['stoi'])
+    avg_pesq = np.mean(results['pesq'])
+
+    print("\n" + "="*40)
+    print("   FINAL EVALUATION REPORT")
+    print("="*40)
+    print(f"Total Samples:   {len(results['sisdr'])}")
+    print("-" * 40)
+    print(f"AVERAGE SI-SDR:  {avg_sisdr:.4f} dB")
+    print(f"AVERAGE STOI:    {avg_stoi:.4f}")
+    print(f"AVERAGE PESQ:    {avg_pesq:.4f}")
+    print("="*40)
+    print("   HIGHEST STOI CASE")
+    print("="*40)
+    print(f"Sample:          {best_stoi_sample}")
+    print(f"Best STOI:       {best_stoi:.4f}")
+    print(f"Corresponding PESQ: {best_stoi_stats.get('pesq',0):.4f}")
+    print(f"Corresponding SI-SDR: {best_stoi_stats.get('sisdr',0):.4f} dB")
+    print("-" * 40)
+    print(f"Best Audio Saved as 'BEST_STOI_output.wav' in: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
-    run_inference()
+    run_evaluation()
