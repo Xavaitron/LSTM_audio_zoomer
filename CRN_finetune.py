@@ -12,25 +12,20 @@ import numpy as np
 from tqdm import tqdm
 
 # ==========================================
-# 1. CONFIGURATION (FINE-TUNING SETUP)
+# 1. CONFIGURATION (PESQ OPTIMIZATION SETUP)
 # ==========================================
-# CHANGE THIS to the folder containing your specific Male/Female data
 DATASET_ROOT = r"D:\anechoic_dataset_v3_male_female" 
-
-# PATH to your existing 60-epoch model
-PRETRAINED_PATH = "CRN_Model.pth"
-
-# OUTPUT PATH for the new model
-NEW_MODEL_NAME = "CRN_Model_FineTuned.pth"
+PRETRAINED_PATH = "CRN_Model_FineTuned.pth"
+NEW_MODEL_NAME = "CRN_Model_FineTuned_HighPESQ.pth" 
 
 # HYPERPARAMETERS
-BATCH_SIZE = 128          # Adjust based on your VRAM (32 or 64 is often good)
-LEARNING_RATE = 1e-4     # LOWER LR for Fine-Tuning (was 1e-3)
-N_EPOCHS = 30            # Fewer epochs needed for fine-tuning
-PATIENCE = 5
+BATCH_SIZE = 128
+LEARNING_RATE = 1e-4      # Low LR for fine-tuning
+N_EPOCHS = 15             # Reduced: PESQ fine-tuning converges quickly
+PATIENCE = 3              # Stricter patience to prevent overfitting specific voices
 N_FFT = 512
 HOP_LENGTH = 160
-SILENCE_PROB = 0.1       # Lower silence prob to focus on active separation
+SILENCE_PROB = 0.1
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -49,7 +44,6 @@ class RoomAcousticDataset(Dataset):
         
         if len(self.sample_folders) == 0:
             print(f"WARNING: No 'sample_XXXXX' folders found in {root_dir}")
-            print("Please check DATASET_ROOT path.")
         else:
             print(f"Found {len(self.sample_folders)} samples. Silence Prob: {silence_prob}")
 
@@ -82,7 +76,6 @@ class RoomAcousticDataset(Dataset):
             
         mixture = self._load_audio(mix_path)
         
-        # Negative Sampling (Silence Training)
         if random.random() < self.silence_prob:
             valid_angle = False
             while not valid_angle:
@@ -109,62 +102,50 @@ class SpatialMediumCRN(nn.Module):
         self.hop_length = hop_length
         self.register_buffer('window', torch.hann_window(n_fft))
         
-        # Encoder (2ch -> 256ch)
         self.enc1 = nn.Conv2d(4, 32, (3,3), stride=(2,1), padding=(1,1))
         self.enc2 = nn.Conv2d(32, 64, (3,3), stride=(2,1), padding=(1,1))
         self.enc3 = nn.Conv2d(64, 128, (3,3), stride=(2,1), padding=(1,1))
         self.enc4 = nn.Conv2d(128, 256, (3,3), stride=(2,1), padding=(1,1))
         
-        # Angle Net
         self.angle_net = nn.Sequential(
             nn.Linear(2, 128), nn.ReLU(), nn.Linear(128, 256)
         )
         
-        # Bottleneck
         self.gru_input_dim = 256 * 17
         self.gru_hidden_dim = 256
         self.gru = nn.GRU(self.gru_input_dim, self.gru_hidden_dim, batch_first=True)
         self.gru_fc = nn.Linear(self.gru_hidden_dim, self.gru_input_dim)
         
-        # Decoder
         self.dec4 = nn.ConvTranspose2d(512, 128, (3,3), stride=(2,1), padding=(1,1), output_padding=(0,0))
         self.dec3 = nn.ConvTranspose2d(256, 64, (3,3), stride=(2,1), padding=(1,1), output_padding=(0,0))
         self.dec2 = nn.ConvTranspose2d(128, 32, (3,3), stride=(2,1), padding=(1,1), output_padding=(0,0))
         self.dec1 = nn.ConvTranspose2d(64, 2, (3,3), stride=(2,1), padding=(1,1), output_padding=(0,0))
 
     def forward(self, x, angle):
-        # STFT
         stft = torch.stft(x.reshape(-1, x.shape[-1]), self.n_fft, self.hop_length, window=self.window, return_complex=True)
         stft = stft.view(x.shape[0], 2, stft.shape[-2], stft.shape[-1])
         feat = torch.cat([stft.real, stft.imag], dim=1)
         
-        # Encode
         e1 = F.elu(self.enc1(feat))
         e2 = F.elu(self.enc2(e1))
         e3 = F.elu(self.enc3(e2))
         e4 = F.elu(self.enc4(e3))
         
-        # Angle Injection
         rad = torch.deg2rad(angle)
         angle_vec = torch.cat([torch.sin(rad), torch.cos(rad)], dim=1)
         angle_emb = self.angle_net(angle_vec).unsqueeze(-1).unsqueeze(-1)
         
-        # Bottleneck
         b, c, f, t = e4.shape
         gru_in = e4.permute(0, 3, 1, 2).reshape(b, t, -1)
         gru_out, _ = self.gru(gru_in)
         gru_out = F.relu(self.gru_fc(gru_out)).reshape(b, t, c, f).permute(0, 2, 3, 1)
-        
-        # Gate
         gru_out = gru_out + angle_emb
         
-        # Decode
         d4 = F.elu(self.dec4(torch.cat([gru_out, e4], dim=1)))
         d3 = F.elu(self.dec3(torch.cat([d4, e3], dim=1)))
         d2 = F.elu(self.dec2(torch.cat([d3, e2], dim=1)))
         mask = self.dec1(torch.cat([d2, e1], dim=1))
         
-        # Apply Mask
         ref = stft[:, 0]
         m_real, m_imag = mask[:, 0], mask[:, 1]
         est_real = ref.real * m_real - ref.imag * m_imag
@@ -174,15 +155,15 @@ class SpatialMediumCRN(nn.Module):
         return torch.istft(est_complex, self.n_fft, self.hop_length, window=self.window)
 
 # ==========================================
-# 4. LOSS FUNCTION
+# 4. LOSS FUNCTIONS (SI-SDR + MULTI-RES STFT)
 # ==========================================
+
+# A. Standard SI-SDR Loss (For Separation)
 class SpatialSeparationLoss(nn.Module):
-    def __init__(self, n_fft=512, hop_length=160, alpha_sisdr=1.0, alpha_spectral=5.0):
+    def __init__(self, n_fft=512, hop_length=160):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
-        self.alpha_sisdr = alpha_sisdr
-        self.alpha_spectral = alpha_spectral
         self.register_buffer('window', torch.hann_window(n_fft))
         self.mse = nn.MSELoss()
 
@@ -196,21 +177,6 @@ class SpatialSeparationLoss(nn.Module):
         ratio = torch.sum(projection ** 2, dim=-1) / (torch.sum(noise ** 2, dim=-1) + eps)
         return -10 * torch.log10(ratio + eps).mean()
 
-    def spectral_correlation(self, estimate, reference):
-        est_stft = torch.stft(estimate, self.n_fft, self.hop_length, window=self.window, return_complex=True)
-        ref_stft = torch.stft(reference, self.n_fft, self.hop_length, window=self.window, return_complex=True)
-        mag_est = torch.abs(est_stft) + 1e-8
-        mag_ref = torch.abs(ref_stft) + 1e-8
-        
-        mu_est = torch.mean(mag_est, dim=1, keepdim=True)
-        std_est = torch.std(mag_est, dim=1, keepdim=True) + 1e-8
-        norm_est = (mag_est - mu_est) / std_est
-        
-        mu_ref = torch.mean(mag_ref, dim=1, keepdim=True)
-        std_ref = torch.std(mag_ref, dim=1, keepdim=True) + 1e-8
-        norm_ref = (mag_ref - mu_ref) / std_ref
-        return -torch.mean(norm_est * norm_ref)
-
     def forward(self, estimate, reference):
         min_len = min(estimate.shape[-1], reference.shape[-1])
         estimate = estimate[..., :min_len]
@@ -219,33 +185,57 @@ class SpatialSeparationLoss(nn.Module):
         ref_energy = torch.sum(reference ** 2, dim=-1)
         has_speech = ref_energy > 1e-5
         
-        total_loss = torch.tensor(0.0, device=estimate.device)
-        count = 0
-
         if has_speech.any():
-            l_time = self.si_sdr(estimate[has_speech], reference[has_speech])
-            l_freq = self.spectral_correlation(estimate[has_speech], reference[has_speech])
-            total_loss += (self.alpha_sisdr * l_time) + (self.alpha_spectral * l_freq)
-            count += 1
-            
-        if (~has_speech).any():
-            l_silence = self.mse(estimate[~has_speech], reference[~has_speech]) * 1000.0 
-            total_loss += l_silence
-            count += 1
+            loss = self.si_sdr(estimate[has_speech], reference[has_speech])
+            return loss
+        else:
+            return self.mse(estimate, reference) * 1000.0
 
-        return total_loss / max(count, 1)
+# B. NEW Multi-Resolution STFT Loss (For PESQ/Quality)
+class MultiResolutionSTFTLoss(nn.Module):
+    def __init__(self, fft_sizes=[512, 1024, 2048], hop_sizes=[50, 120, 240], win_lengths=[240, 600, 1200]):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_lengths = win_lengths
+
+    def stft(self, x, fft_size, hop_size, win_length):
+        return torch.stft(x, fft_size, hop_length=hop_size, win_length=win_length, 
+                          window=torch.hann_window(win_length).to(x.device), 
+                          return_complex=True)
+
+    def forward(self, est, target):
+        loss = 0.0
+        min_len = min(est.shape[-1], target.shape[-1])
+        est, target = est[..., :min_len], target[..., :min_len]
+
+        for n_fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
+            est_stft = self.stft(est, n_fft, hop, win)
+            tgt_stft = self.stft(target, n_fft, hop, win)
+            
+            est_mag = torch.abs(est_stft) + 1e-7
+            tgt_mag = torch.abs(tgt_stft) + 1e-7
+            
+            # Spectral Convergence
+            sc_loss = torch.norm(tgt_mag - est_mag, p="fro") / (torch.norm(tgt_mag, p="fro") + 1e-7)
+            # Log Magnitude (L1)
+            mag_loss = F.l1_loss(torch.log(tgt_mag), torch.log(est_mag))
+            
+            loss += sc_loss + mag_loss
+            
+        return loss / len(self.fft_sizes)
 
 # ==========================================
-# 5. FINE-TUNING LOOP
+# 5. FINE-TUNING LOOP WITH MIXED LOSS
 # ==========================================
 def main():
-    print(f"--- Fine-Tuning Spatial Audio Model on {DEVICE} ---")
+    print(f"--- Fine-Tuning for PESQ on {DEVICE} ---")
     
-    # 1. Dataset Setup
+    # 1. Dataset
     try:
         full_dataset = RoomAcousticDataset(DATASET_ROOT, silence_prob=SILENCE_PROB)
     except Exception as e:
-        print(f"Error loading dataset: {e}")
+        print(f"Error: {e}")
         return
 
     train_size = int(0.95 * len(full_dataset))
@@ -255,36 +245,31 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
     
-    # 2. Model Initialization
+    # 2. Model
     model = SpatialMediumCRN(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     
-    # ========================================================
-    # LOAD PRE-TRAINED WEIGHTS
-    # ========================================================
+    # Load Weights
     if os.path.exists(PRETRAINED_PATH):
-        print(f"\n[INFO] Loading pre-trained weights from: {PRETRAINED_PATH}")
+        print(f"[INFO] Loading pre-trained weights from: {PRETRAINED_PATH}")
         try:
             state_dict = torch.load(PRETRAINED_PATH, map_location=DEVICE, weights_only=True)
             model.load_state_dict(state_dict)
-            print("[INFO] Weights loaded successfully. Proceeding to fine-tune.")
         except Exception as e:
-            print(f"[ERROR] Failed to load weights: {e}")
+            print(f"[ERROR] {e}")
             return
     else:
-        print(f"\n[WARNING] Pre-trained file '{PRETRAINED_PATH}' NOT FOUND!")
-        print("Training will start from scratch (Random Initialization).")
-        input("Press Enter to continue anyway, or Ctrl+C to stop...")
+        print(f"[WARNING] Pre-trained file not found! Starting scratch.")
 
-    # 3. Optimizer & Loss
-    # We re-initialize the optimizer for fine-tuning to reset momentum/buffers
+    # 3. Optimizer & Mixed Loss Setup
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = SpatialSeparationLoss().to(DEVICE)
+    
+    criterion_sisdr = SpatialSeparationLoss().to(DEVICE)
+    criterion_mrstft = MultiResolutionSTFTLoss().to(DEVICE)
     
     best_val_loss = float('inf')
     patience_counter = 0 
     
-    print(f"\nStarting Fine-Tuning: {len(train_ds)} train, {len(val_ds)} validation.")
-    print(f"Targeting: {NEW_MODEL_NAME}\n")
+    print(f"\nStarting PESQ Fine-Tuning: {len(train_ds)} train, {len(val_ds)} validation.")
     
     for epoch in range(N_EPOCHS):
         model.train()
@@ -294,18 +279,23 @@ def main():
         for mixture, angle, target in loop:
             mixture, angle, target = mixture.to(DEVICE), angle.to(DEVICE), target.to(DEVICE).squeeze(1)
             
-            # Forward
             estimate = model(mixture, angle)
-            loss = criterion(estimate, target)
             
-            # Backward
+            # --- MIXED LOSS CALCULATION ---
+            loss_s = criterion_sisdr(estimate, target)
+            loss_m = criterion_mrstft(estimate, target)
+            
+            # Weight: SI-SDR (1.0) + MultiRes (10.0)
+            # We scale MultiRes by 10 because its raw value is usually small (~0.5-1.0) compared to SI-SDR gradients
+            loss = loss_s + (10.0 * loss_m)
+            
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             
             train_loss_total += loss.item()
-            loop.set_postfix(loss=loss.item())
+            loop.set_postfix(sisdr=f"{loss_s.item():.2f}", mr_stft=f"{loss_m.item():.2f}")
             
         # Validation
         model.eval()
@@ -314,7 +304,12 @@ def main():
             for mixture, angle, target in val_loader:
                 mixture, angle, target = mixture.to(DEVICE), angle.to(DEVICE), target.to(DEVICE).squeeze(1)
                 estimate = model(mixture, angle)
-                val_loss_total += criterion(estimate, target).item()
+                
+                l_s = criterion_sisdr(estimate, target)
+                l_m = criterion_mrstft(estimate, target)
+                val_loss = l_s + (10.0 * l_m)
+                
+                val_loss_total += val_loss.item()
         
         avg_val_loss = val_loss_total / len(val_loader)
         print(f"Validation Loss: {avg_val_loss:.4f}")
@@ -324,7 +319,7 @@ def main():
             best_val_loss = avg_val_loss
             patience_counter = 0
             torch.save(model.state_dict(), NEW_MODEL_NAME)
-            print(f">>> New Best Model Saved: {NEW_MODEL_NAME}")
+            print(f">>> New Best PESQ Model Saved: {NEW_MODEL_NAME}")
         else:
             patience_counter += 1
             print(f"No improvement. Counter: {patience_counter}/{PATIENCE}")

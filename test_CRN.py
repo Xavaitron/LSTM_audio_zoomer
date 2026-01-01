@@ -12,7 +12,7 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_PATH = "CRN_Model_FineTuned.pth"        # Path to your BEST model
+MODEL_PATH = "CRN_Model_FineTuned_HighPESQ.pth"       
 TEST_DATASET_ROOT = r"D:\test_dataset" 
 OUTPUT_DIR = "evaluation_CRN"    
 SAMPLE_RATE = 16000

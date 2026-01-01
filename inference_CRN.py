@@ -11,7 +11,7 @@ from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEval
 # 1. CONFIGURATION
 # ==========================================
 MODEL_PATH = "CRN_Model_FineTuned.pth"        # Path to your trained model checkpoint
-SAMPLE_FOLDER = r"D:\test_dataset\test_sample_00017" 
+SAMPLE_FOLDER = r"D:\test_dataset\test_sample_04005" 
 OUTPUT_DIR = "test_inference_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
