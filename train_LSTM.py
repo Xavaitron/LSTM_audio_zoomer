@@ -16,16 +16,15 @@ from tqdm import tqdm
 DATASET_ROOT = r"D:\anechoic_dataset_v3"
 
 # Hyperparameters
-BATCH_SIZE = 512         # 128 consumes around 3.7G/4G for a RTX3050 laptop GPU
-LEARNING_RATE = 1e-3     # Standard Adam LR
-N_EPOCHS = 60            # Max number of epochs
-PATIENCE = 10            # Early Stopping Patience
-N_FFT = 512              # Number of FFT bins
-HOP_LENGTH = 160         # 10ms at 16kHz
-HIDDEN_SIZE = 320        # Tuned for the target parameter size
-NUM_WORKERS = 8          # Number of CPU threads for data loading
+BATCH_SIZE = 512         
+LEARNING_RATE = 1e-3     
+N_EPOCHS = 60            
+N_FFT = 512              
+HOP_LENGTH = 160         
+HIDDEN_SIZE = 320        
+NUM_WORKERS = 8          
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 
 # ==========================================
@@ -236,10 +235,9 @@ def main():
     torch_window = torch.hann_window(N_FFT).to(DEVICE)
     
     best_val_loss = float('inf')
-    patience_counter = 0 
     
     print(f"Starting Training: {len(train_ds)} train, {len(val_ds)} validation samples.")
-    print(f"Early Stopping Patience: {PATIENCE} epochs")
+    print("Early Stopping: DISABLED (Will run for all epochs)")
     
     for epoch in range(N_EPOCHS):
         model.train()
@@ -308,19 +306,14 @@ def main():
         avg_val_loss = val_loss_total / len(val_loader)
         print(f"Validation Loss: {avg_val_loss:.4f}")
         
-        # --- EARLY STOPPING CHECK ---
+        # --- NO EARLY STOPPING ---
+        # We still save the best model if improved, but we do NOT break the loop.
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            patience_counter = 0  # Reset counter
             torch.save(model.state_dict(), "LSTM_model_v2.pth")
             print(">>> New Best Model Saved!")
         else:
-            patience_counter += 1
-            print(f"No improvement. Early Stopping Counter: {patience_counter}/{PATIENCE}")
-            
-            if patience_counter >= PATIENCE:
-                print("!!! Early stopping triggered. Training stopped. !!!")
-                break
+            print(f"No improvement. Continuing training...")
             
     print("Training Complete.")
 

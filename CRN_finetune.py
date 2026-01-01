@@ -24,7 +24,7 @@ PRETRAINED_PATH = "CRN_Model.pth"
 NEW_MODEL_NAME = "CRN_Model_FineTuned.pth"
 
 # HYPERPARAMETERS
-BATCH_SIZE = 16          # Adjust based on your VRAM (32 or 64 is often good)
+BATCH_SIZE = 128          # Adjust based on your VRAM (32 or 64 is often good)
 LEARNING_RATE = 1e-4     # LOWER LR for Fine-Tuning (was 1e-3)
 N_EPOCHS = 30            # Fewer epochs needed for fine-tuning
 PATIENCE = 5
