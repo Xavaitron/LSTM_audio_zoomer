@@ -12,8 +12,8 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_PATH = "CRN_Model_FineTuned_CompressedPESQ.pth"       
-TEST_DATASET_ROOT = r"D:\test_dataset" 
+MODEL_PATH = "CRN_Reverb.pth"       
+TEST_DATASET_ROOT = r"D:\reverb_dataset_v3_male_female"
 OUTPUT_DIR = "evaluation_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
