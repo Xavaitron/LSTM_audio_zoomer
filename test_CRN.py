@@ -12,13 +12,13 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-MODEL_PATH = "CRN_Reverb.pth"       
-TEST_DATASET_ROOT = r"D:\reverb_dataset_v3_male_female"
+MODEL_PATH = "CRN_Model_FineTuned_CompressedPESQ.pth"       
+TEST_DATASET_ROOT = r"D:\test_dataset"
 OUTPUT_DIR = "evaluation_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
 HOP_LENGTH = 160
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
 
 # ==========================================
 # 2. MODEL DEFINITION
@@ -144,15 +144,12 @@ def run_evaluation():
     
     # Storage for Averages
     results = {'sisdr': [], 'stoi': [], 'pesq': []}
-    
-    # Storage for Best STOI
-    best_stoi = -1.0
-    best_stoi_sample = ""
-    best_stoi_stats = {}
+    sample_names = []
 
     # 4. Loop
     for folder_path in tqdm(sample_folders):
         sample_name = os.path.basename(folder_path)
+        sample_names.append(sample_name)
         mix_path = os.path.join(folder_path, "mixture.wav")
         target_path = os.path.join(folder_path, "target.wav")
         meta_path = os.path.join(folder_path, "meta.json")
@@ -189,18 +186,6 @@ def run_evaluation():
                 results['pesq'].append(s_pesq)
                 results['stoi'].append(s_stoi)
                 results['sisdr'].append(s_sisdr)
-                
-                # Check for New Best STOI
-                if s_stoi > best_stoi:
-                    best_stoi = s_stoi
-                    best_stoi_sample = sample_name
-                    best_stoi_stats = {'sisdr': s_sisdr, 'pesq': s_pesq, 'stoi': s_stoi}
-                    
-                    # Save "BEST" files immediately
-                    os.makedirs(OUTPUT_DIR, exist_ok=True)
-                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_output.wav"), est_trim.cpu(), SAMPLE_RATE)
-                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_mixture.wav"), mixture.squeeze(0).cpu(), SAMPLE_RATE)
-                    torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_STOI_target.wav"), tgt_trim.cpu(), SAMPLE_RATE)
 
         except Exception as e:
             print(f"Error processing {sample_name}: {e}")
@@ -211,6 +196,28 @@ def run_evaluation():
     avg_stoi = np.mean(results['stoi'])
     avg_pesq = np.mean(results['pesq'])
 
+    # Calculate Overall Best (Normalized Sum)
+    sisdr_arr = np.array(results['sisdr'])
+    stoi_arr = np.array(results['stoi'])
+    pesq_arr = np.array(results['pesq'])
+
+    def normalize(arr):
+        if arr.max() == arr.min(): return np.zeros_like(arr)
+        return (arr - arr.min()) / (arr.max() - arr.min())
+
+    norm_sisdr = normalize(sisdr_arr)
+    norm_stoi = normalize(stoi_arr)
+    norm_pesq = normalize(pesq_arr)
+
+    # Combined Score: Sum of normalized metrics (0-3 range)
+    combined_score = norm_sisdr + norm_stoi + norm_pesq
+    best_idx = np.argmax(combined_score)
+    best_sample_name = sample_names[best_idx]
+    
+    best_sisdr = sisdr_arr[best_idx]
+    best_stoi = stoi_arr[best_idx]
+    best_pesq = pesq_arr[best_idx]
+
     print("\n" + "="*40)
     print("   FINAL EVALUATION REPORT")
     print("="*40)
@@ -220,14 +227,47 @@ def run_evaluation():
     print(f"AVERAGE STOI:    {avg_stoi:.4f}")
     print(f"AVERAGE PESQ:    {avg_pesq:.4f}")
     print("="*40)
-    print("   HIGHEST STOI CASE")
+    print("   BEST OVERALL CASE (Combined Metric)")
     print("="*40)
-    print(f"Sample:          {best_stoi_sample}")
-    print(f"Best STOI:       {best_stoi:.4f}")
-    print(f"Corresponding PESQ: {best_stoi_stats.get('pesq',0):.4f}")
-    print(f"Corresponding SI-SDR: {best_stoi_stats.get('sisdr',0):.4f} dB")
+    print(f"Sample:          {best_sample_name}")
+    print(f"Combined Score:  {combined_score[best_idx]:.4f} / 3.0")
+    print(f"SI-SDR:          {best_sisdr:.4f} dB")
+    print(f"STOI:            {best_stoi:.4f}")
+    print(f"PESQ:            {best_pesq:.4f}")
     print("-" * 40)
-    print(f"Best Audio Saved as 'BEST_STOI_output.wav' in: {OUTPUT_DIR}")
+    
+    # Save Best Case
+    print(f"Saving Best Overall Case: {best_sample_name}...")
+    best_folder = sample_folders[best_idx]
+    mix_path = os.path.join(best_folder, "mixture.wav")
+    target_path = os.path.join(best_folder, "target.wav")
+    meta_path = os.path.join(best_folder, "meta.json")
+    
+    try:
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+            target_angle = float(meta['target_angle'])
+            
+        mixture = load_audio(mix_path).unsqueeze(0).to(DEVICE)
+        target = load_audio(target_path)
+        if target.shape[0] > 1: target = target[0:1, :] 
+        target = target.to(DEVICE)
+        
+        angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        
+        with torch.no_grad():
+            estimate = model(mixture, angle_tensor)
+            min_len = min(estimate.shape[-1], target.shape[-1])
+            est_trim = estimate[..., :min_len]
+            tgt_trim = target[..., :min_len]
+            
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_OVERALL_output.wav"), est_trim.cpu(), SAMPLE_RATE)
+            torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_OVERALL_mixture.wav"), mixture.squeeze(0).cpu(), SAMPLE_RATE)
+            torchaudio.save(os.path.join(OUTPUT_DIR, f"BEST_OVERALL_target.wav"), tgt_trim.cpu(), SAMPLE_RATE)
+            print(f"Saved audio files to {OUTPUT_DIR}")
+    except Exception as e:
+        print(f"Error saving best case: {e}")
 
 if __name__ == "__main__":
     run_evaluation()

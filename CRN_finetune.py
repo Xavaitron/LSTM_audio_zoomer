@@ -14,18 +14,18 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION (COMPRESSED PESQ OPTIMIZATION)
 # ==========================================
-DATASET_ROOT = r"D:\anechoic_dataset_v3_male_female" 
-PRETRAINED_PATH = "CRN_Model_FineTuned_HighPESQ.pth"
-NEW_MODEL_NAME = "CRN_Model_FineTuned_CompressedPESQ.pth" 
+DATASET_ROOT = r"D:\reverb_dataset_v3_male_female" 
+PRETRAINED_PATH = "CRN_Reverb"
+NEW_MODEL_NAME = "CRN_Reverb_finetuned.pth" 
 
 # HYPERPARAMETERS
 BATCH_SIZE = 128
-LEARNING_RATE = 1e-4      
-N_EPOCHS = 20             # Increased to 20 for Compressed Loss convergence
-PATIENCE = 5              # Relaxed slightly to allow for fine detail learning
+LEARNING_RATE = 1e-3      
+N_EPOCHS = 60             # Increased to 20 for Compressed Loss convergence
+PATIENCE = 20              # Relaxed slightly to allow for fine detail learning
 N_FFT = 512
 HOP_LENGTH = 160
-SILENCE_PROB = 0.1
+SILENCE_PROB = 0.3
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

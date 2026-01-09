@@ -1,6 +1,6 @@
 import os
 import json
-import time  # <--- Added for timing
+import time  
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +12,7 @@ from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEval
 # 1. CONFIGURATION
 # ==========================================
 MODEL_PATH = "CRN_Model_FineTuned_CompressedPESQ.pth"        
-SAMPLE_FOLDER = r"D:\test_dataset\test_sample_00380" 
+SAMPLE_FOLDER = r"D:\test_reverb" 
 OUTPUT_DIR = "test_inference_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512
