@@ -18,7 +18,7 @@ DATASET_ROOT = r"D:\anechoic_dataset_v3"
 BATCH_SIZE = 512
 LEARNING_RATE = 1e-3
 N_EPOCHS = 60
-PATIENCE = 10
+
 N_FFT = 512
 HOP_LENGTH = 160
 SILENCE_PROB = 0.3
@@ -244,7 +244,7 @@ def main():
     criterion = SpatialSeparationLoss().to(DEVICE)
     
     best_val_loss = float('inf')
-    patience_counter = 0 
+
     
     print(f"Starting Training: {len(train_ds)} train, {len(val_ds)} validation.")
     
@@ -281,15 +281,8 @@ def main():
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "CRN_Model.pth")
+            torch.save(model.state_dict(), "CRN_Reverb_Fixed.pth")
             print(">>> New Best Model Saved!")
-        else:
-            patience_counter += 1
-            print(f"No improvement. Counter: {patience_counter}/{PATIENCE}")
-            if patience_counter >= PATIENCE:
-                print("!!! Early stopping triggered !!!")
-                break
             
     print("Training Complete.")
 
