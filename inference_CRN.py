@@ -12,7 +12,7 @@ from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEval
 # 1. CONFIGURATION
 # ==========================================
 MODEL_PATH = "CRN_Model_FineTuned_CompressedPESQ.pth"        
-SAMPLE_FOLDER = r"D:\test_reverb" 
+SAMPLE_FOLDER = r"D:\test1" 
 OUTPUT_DIR = "test_inference_CRN"    
 SAMPLE_RATE = 16000
 N_FFT = 512

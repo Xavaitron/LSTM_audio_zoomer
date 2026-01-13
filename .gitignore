@@ -2,4 +2,6 @@
 /inference_output
 /inference_CRN
 /evaluation_CRN
+/evaluation_DCCRN
 /test_inference_CRN
+/Task2_Reverberant
