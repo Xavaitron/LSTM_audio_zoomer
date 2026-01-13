@@ -14,13 +14,13 @@ from tqdm import tqdm
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-DATASET_ROOT = r"./final_reverb_fixed"
-BATCH_SIZE = 32  # Reduced for complex model
-LEARNING_RATE = 5e-4
-N_EPOCHS = 100
+DATASET_ROOT = r"D:/final_reverb_fixed"
+BATCH_SIZE = 4
+LEARNING_RATE = 6e-5  # Scaled down for smaller batch
+N_EPOCHS = 25
 N_FFT = 512
 HOP_LENGTH = 128  # Finer resolution for reverb
-SILENCE_PROB = 0.3
+SILENCE_PROB = 0.0
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
