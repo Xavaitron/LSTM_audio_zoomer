@@ -334,18 +334,24 @@ class DCCRNpp(nn.Module):
 
 
 # ==========================================
-# 7. SI-SDR DOMINANT LOSS
+# 7. SI-SDR + PERCEPTUAL LOSS
 # ==========================================
-class SISdrDominantLoss(nn.Module):
-    """Loss function prioritizing SI-SDR for reverberant conditions."""
-    def __init__(self, n_fft=512, hop_length=128, alpha_sisdr=10.0, alpha_spectral=1.0):
+class SISdrPerceptualLoss(nn.Module):
+    """Loss function with SI-SDR + Mel perceptual loss for PESQ improvement."""
+    def __init__(self, n_fft=512, hop_length=128, alpha_sisdr=10.0, alpha_spectral=1.0, alpha_mel=2.0):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.alpha_sisdr = alpha_sisdr
         self.alpha_spectral = alpha_spectral
+        self.alpha_mel = alpha_mel
         self.register_buffer('window', torch.hann_window(n_fft))
         self.mse = nn.MSELoss()
+        
+        # Mel spectrogram for perceptual loss
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80
+        )
 
     def si_sdr(self, estimate, reference):
         eps = 1e-8
@@ -379,6 +385,15 @@ class SISdrDominantLoss(nn.Module):
             total_loss += mag_loss + log_mag_loss
         return total_loss / 3
 
+    def mel_perceptual_loss(self, estimate, reference):
+        """Mel-spectrogram loss as differentiable PESQ proxy."""
+        # Move mel transform to correct device
+        mel_transform = self.mel_transform.to(estimate.device)
+        
+        est_mel = torch.log(mel_transform(estimate) + 1e-8)
+        ref_mel = torch.log(mel_transform(reference) + 1e-8)
+        return F.l1_loss(est_mel, ref_mel)
+
     def forward(self, estimate, reference):
         min_len = min(estimate.shape[-1], reference.shape[-1])
         estimate = estimate[..., :min_len]
@@ -393,7 +408,8 @@ class SISdrDominantLoss(nn.Module):
         if has_speech.any():
             l_sisdr = self.si_sdr(estimate[has_speech], reference[has_speech])
             l_stft = self.multi_resolution_stft_loss(estimate[has_speech], reference[has_speech])
-            total_loss += (self.alpha_sisdr * l_sisdr) + (self.alpha_spectral * l_stft)
+            l_mel = self.mel_perceptual_loss(estimate[has_speech], reference[has_speech])
+            total_loss += (self.alpha_sisdr * l_sisdr) + (self.alpha_spectral * l_stft) + (self.alpha_mel * l_mel)
             count += 1
             
         if (~has_speech).any():
@@ -438,8 +454,8 @@ def main():
     # Cosine annealing scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
     
-    # SI-SDR dominant loss
-    criterion = SISdrDominantLoss(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
+    # SI-SDR + Perceptual loss (with Mel for PESQ improvement)
+    criterion = SISdrPerceptualLoss(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
     
     best_val_loss = float('inf')
     

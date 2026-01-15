@@ -8,6 +8,7 @@ import torchaudio
 import numpy as np
 from torchmetrics.audio import ShortTimeObjectiveIntelligibility, PerceptualEvaluationSpeechQuality, ScaleInvariantSignalDistortionRatio
 from tqdm import tqdm
+import time
 
 # ==========================================
 # 1. CONFIGURATION
@@ -251,6 +252,11 @@ def load_audio(path, target_len=None):
             
     return waveform
 
+
+def count_parameters(model):
+    """Count trainable parameters in model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 # ==========================================
 # 5. MAIN EVALUATION LOOP
 # ==========================================
@@ -267,6 +273,10 @@ def run_evaluation():
         print(f"Error: Model file '{MODEL_PATH}' not found!")
         return
     model.eval()
+    
+    # Print model info
+    num_params = count_parameters(model)
+    print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
 
     # 2. Setup Metrics
     pesq_metric = PerceptualEvaluationSpeechQuality(fs=SAMPLE_RATE, mode='wb').to(DEVICE)
@@ -284,6 +294,7 @@ def run_evaluation():
     
     # Storage for Averages
     results = {'sisdr': [], 'stoi': [], 'pesq': []}
+    inference_times = []
     sample_names = []
 
     # 4. Loop
@@ -310,7 +321,11 @@ def run_evaluation():
             angle_tensor = torch.tensor([target_angle], dtype=torch.float32).unsqueeze(0).to(DEVICE)
             
             with torch.no_grad():
+                # Measure inference time
+                start_time = time.perf_counter()
                 estimate = model(mixture, angle_tensor)
+                end_time = time.perf_counter()
+                inference_times.append(end_time - start_time)
                 
                 # Align lengths
                 min_len = min(estimate.shape[-1], target.shape[-1])
@@ -374,6 +389,14 @@ def run_evaluation():
     print(f"SI-SDR:          {best_sisdr:.4f} dB")
     print(f"STOI:            {best_stoi:.4f}")
     print(f"PESQ:            {best_pesq:.4f}")
+    print("="*40)
+    print("   INFERENCE STATISTICS")
+    print("="*40)
+    avg_inference_time = np.mean(inference_times) * 1000  # Convert to ms
+    std_inference_time = np.std(inference_times) * 1000
+    print(f"Avg Inference:   {avg_inference_time:.2f} ms")
+    print(f"Std Inference:   {std_inference_time:.2f} ms")
+    print(f"Real-time Factor: {(3.0 * 1000) / avg_inference_time:.2f}x (for 3s audio)")
     print("-" * 40)
     
     # Save Best Case
