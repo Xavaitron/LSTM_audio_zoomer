@@ -17,8 +17,8 @@ import math
 # ==========================================
 DATASET_ROOT = r"./final_reverb_fixed"
 BATCH_SIZE = 4
-LEARNING_RATE = 6e-5
-N_EPOCHS = 25
+LEARNING_RATE = 2e-5  # Lower LR for fine-tuning
+N_EPOCHS = 10         # Quick fine-tune
 N_FFT = 512
 HOP_LENGTH = 128
 SILENCE_PROB = 0.0
@@ -454,20 +454,22 @@ class DCCRNConformer(nn.Module):
 
 
 # ==========================================
-# 6. SI-SDR + PERCEPTUAL LOSS
+# 6. SI-SDR + PERCEPTUAL + PHASE LOSS (AGGRESSIVE PESQ)
 # ==========================================
 class SISdrPerceptualLoss(nn.Module):
-    def __init__(self, n_fft=512, hop_length=128, alpha_sisdr=10.0, alpha_spectral=1.0, alpha_mel=2.0):
+    def __init__(self, n_fft=512, hop_length=128, alpha_sisdr=10.0, alpha_spectral=1.0, alpha_mel=8.0, alpha_phase=1.0):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.alpha_sisdr = alpha_sisdr
         self.alpha_spectral = alpha_spectral
         self.alpha_mel = alpha_mel
+        self.alpha_phase = alpha_phase
         self.register_buffer('window', torch.hann_window(n_fft))
         self.mse = nn.MSELoss()
+        # Increased mel bands for finer perceptual resolution
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80
+            sample_rate=16000, n_fft=1024, hop_length=256, n_mels=128
         )
 
     def si_sdr(self, estimate, reference):
@@ -501,6 +503,25 @@ class SISdrPerceptualLoss(nn.Module):
         ref_mel = torch.log(mel_transform(reference) + 1e-8)
         return F.l1_loss(est_mel, ref_mel)
 
+    def phase_loss(self, estimate, reference):
+        """Phase-aware loss - critical for PESQ."""
+        total_loss = 0
+        for n_fft in [512, 1024]:
+            hop = n_fft // 4
+            window = torch.hann_window(n_fft, device=estimate.device)
+            est_stft = torch.stft(estimate, n_fft, hop, window=window, return_complex=True)
+            ref_stft = torch.stft(reference, n_fft, hop, window=window, return_complex=True)
+            
+            # Instantaneous phase difference loss
+            est_phase = torch.angle(est_stft)
+            ref_phase = torch.angle(ref_stft)
+            
+            # Use cosine of phase difference (handles wraparound)
+            phase_diff = torch.cos(est_phase - ref_phase)
+            total_loss += (1 - phase_diff.mean())  # Minimize when phases align
+            
+        return total_loss / 2
+
     def forward(self, estimate, reference):
         min_len = min(estimate.shape[-1], reference.shape[-1])
         estimate = estimate[..., :min_len]
@@ -516,7 +537,8 @@ class SISdrPerceptualLoss(nn.Module):
             l_sisdr = self.si_sdr(estimate[has_speech], reference[has_speech])
             l_stft = self.multi_resolution_stft_loss(estimate[has_speech], reference[has_speech])
             l_mel = self.mel_perceptual_loss(estimate[has_speech], reference[has_speech])
-            total_loss += (self.alpha_sisdr * l_sisdr) + (self.alpha_spectral * l_stft) + (self.alpha_mel * l_mel)
+            l_phase = self.phase_loss(estimate[has_speech], reference[has_speech])
+            total_loss += (self.alpha_sisdr * l_sisdr) + (self.alpha_spectral * l_stft) + (self.alpha_mel * l_mel) + (self.alpha_phase * l_phase)
             count += 1
             
         if (~has_speech).any():
@@ -565,7 +587,7 @@ def main():
     
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
-    criterion = SISdrPerceptualLoss(n_fft=N_FFT, hop_length=HOP_LENGTH).to(DEVICE)
+    criterion = SISdrPerceptualLoss(n_fft=N_FFT, hop_length=HOP_LENGTH, alpha_mel=5.0).to(DEVICE)  # Bumped Mel for PESQ
     
     best_val_loss = float('inf')
     
