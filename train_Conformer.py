@@ -25,6 +25,9 @@ SILENCE_PROB = 0.0
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
+# Resume training from checkpoint (set to None to train from scratch)
+RESUME_FROM = "DCCRN_Conformer.pth"  # or None
+
 # ==========================================
 # 2. DATASET LOADER
 # ==========================================
@@ -550,6 +553,15 @@ def main():
     num_params = count_parameters(model)
     print(f"Model parameters: {num_params:,} ({num_params/1e6:.2f}M)")
     assert num_params < 15_000_000, f"Model exceeds 15M params: {num_params:,}"
+    
+    # Load checkpoint if resuming
+    if RESUME_FROM is not None:
+        try:
+            state_dict = torch.load(RESUME_FROM, map_location=DEVICE, weights_only=True)
+            model.load_state_dict(state_dict)
+            print(f"Resumed from checkpoint: {RESUME_FROM}")
+        except FileNotFoundError:
+            print(f"Checkpoint not found: {RESUME_FROM}, training from scratch.")
     
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-6)
